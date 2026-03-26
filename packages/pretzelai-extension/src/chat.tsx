@@ -35,7 +35,8 @@ import {
   getSelectedCode,
   getTopSimilarities,
   PRETZEL_FOLDER,
-  readEmbeddings
+  readEmbeddings,
+  timeoutManager
 } from './utils';
 import { providersInfo } from './migrations/providerInfo';
 import { ImagePreview } from './components/ImagePreview';
@@ -133,7 +134,7 @@ export function Chat({
   const fetchChatHistory = async () => {
     const notebook = notebookTracker?.currentWidget;
     if (!notebook?.model) {
-      setTimeout(fetchChatHistory, 1000);
+      timeoutManager.setTimeout(fetchChatHistory, 1000);
       return;
     }
     if (notebook?.model && !isAiGenerating) {
@@ -221,6 +222,11 @@ export function Chat({
     labShell.currentPathChanged.connect((sender, args) => {
       fetchChatHistory();
     });
+
+    // 组件卸载时清理所有定时器
+    return () => {
+      timeoutManager.clearAll();
+    };
   }, []);
 
   useEffect(() => {

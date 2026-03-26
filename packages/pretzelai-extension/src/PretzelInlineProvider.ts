@@ -16,7 +16,8 @@ import {
 } from '@jupyterlab/completer';
 import { INotebookTracker } from '@jupyterlab/notebook';
 import { ISettingRegistry } from '@jupyterlab/settingregistry';
-import { PLUGIN_ID, streamAnthropicCompletion } from './utils';
+import { PLUGIN_ID, streamAnthropicCompletion, timeoutManager } from './utils';
+import { IChatMessage } from './chatAIUtils';
 import OpenAI from 'openai';
 import { JupyterFrontEnd } from '@jupyterlab/application';
 import posthog from 'posthog-js';
@@ -44,11 +45,44 @@ export class PretzelInlineProvider implements IInlineCompletionProvider {
         posthog.capture('Tab Completion Accepted');
       }
     });
+
+    // 注册 dispose 处理
+    this.disposed.connect(() => {
+      this._cleanup();
+    });
   }
   readonly identifier = '@pretzelai/inline-completer';
   readonly name = 'Pretzel AI inline completion';
-  private debounceTimer: any;
+  private debounceTimer: NodeJS.Timeout | null = null;
   private abortController: AbortController | null = null;
+  private _isDisposed = false;
+
+  // 清理资源的私有方法
+  private _cleanup(): void {
+    if (this.debounceTimer) {
+      timeoutManager.clearTimeout(this.debounceTimer);
+      this.debounceTimer = null;
+    }
+    if (this.abortController) {
+      this.abortController.abort();
+      this.abortController = null;
+    }
+  }
+
+  get isDisposed(): boolean {
+    return this._isDisposed;
+  }
+
+  dispose(): void {
+    if (this._isDisposed) {
+      return;
+    }
+    this._isDisposed = true;
+    this._cleanup();
+    Signal.clearData(this);
+  }
+
+  readonly disposed = new Signal<this, void>(this);
 
   private _prefixFromRequest(request: CompletionHandler.IRequest): string {
     const currentCellIndex = this.notebookTracker?.currentWidget?.model!.sharedModel.cells.findIndex(
@@ -137,7 +171,9 @@ export class PretzelInlineProvider implements IInlineCompletionProvider {
     // Create new AbortController for this fetch
     this.abortController = new AbortController();
 
-    clearTimeout(this.debounceTimer);
+    if (this.debounceTimer) {
+      timeoutManager.clearTimeout(this.debounceTimer);
+    }
     const settings = await this.settingRegistry.load(PLUGIN_ID);
     const pretzelSettingsJSON = settings.get('pretzelSettingsJSON').composite as any;
     const inlineCopilotSettings = pretzelSettingsJSON.features?.inlineCompletion || {};
@@ -162,7 +198,7 @@ export class PretzelInlineProvider implements IInlineCompletionProvider {
     const groqApiKey = providers['Groq']?.apiSettings?.apiKey?.value || '';
 
     return new Promise(resolve => {
-      this.debounceTimer = setTimeout(async () => {
+      this.debounceTimer = timeoutManager.setTimeout(async () => {
         this.isFetchingChanged.emit(true);
 
         let prompt = this._prefixFromRequest(request);
@@ -260,7 +296,8 @@ export class PretzelInlineProvider implements IInlineCompletionProvider {
                   stop: stops,
                   max_tokens: 500,
                   temperature: 0
-                })
+                }),
+                signal: this.abortController?.signal
               });
               // Note: Response parsing might not work as expected due to 'no-cors' mode, which can lead to an opaque response.
               completion = (await data.json()).choices[0].message.content;
@@ -292,11 +329,11 @@ export class PretzelInlineProvider implements IInlineCompletionProvider {
           } else if (copilotProvider === 'Anthropic' && anthropicApiKey) {
             const messages = [
               {
-                role: 'user',
+                role: 'user' as const,
                 content: getInlinePrompt(prompt, suffix)
               }
             ];
-            const stream = await streamAnthropicCompletion(anthropicApiKey, messages, copilotModel, 500);
+            const stream = await streamAnthropicCompletion(anthropicApiKey, messages as IChatMessage[], copilotModel, 500);
             let completionContent = '';
             for await (const chunk of stream) {
               completionContent += chunk.choices[0].delta.content;

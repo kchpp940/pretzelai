@@ -18,6 +18,65 @@ import { processVariables } from './utils';
 import { INotebookTracker } from '@jupyterlab/notebook';
 import { Dispatch, SetStateAction } from 'react';
 
+// 消息内容项接口
+export interface IMessageContentText {
+  type: 'text';
+  text: string;
+}
+
+export interface IMessageContentImage {
+  type: 'image';
+  data: string;
+}
+
+export interface IMessageContentImageUrl {
+  type: 'image_url';
+  image_url: { url: string };
+}
+
+export type TMessageContentItem = IMessageContentText | IMessageContentImage | IMessageContentImageUrl;
+export type TMessageContent = string | TMessageContentItem[];
+
+// 消息接口
+export interface IChatMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: TMessageContent;
+}
+
+// Chat AI Stream 参数接口
+export interface IChatAIStreamParams {
+  aiChatModelProvider: string;
+  aiChatModelString: string;
+  openAiApiKey?: string;
+  openAiBaseUrl?: string;
+  azureBaseUrl?: string;
+  azureApiKey?: string;
+  deploymentId?: string;
+  mistralApiKey?: string;
+  anthropicApiKey?: string;
+  ollamaBaseUrl?: string;
+  groqApiKey?: string;
+  renderChat: (message: string) => void;
+  messages: IChatMessage[];
+  topSimilarities: string[];
+  activeCellCode?: string;
+  selectedCode?: string;
+  setReferenceSource: Dispatch<SetStateAction<string>>;
+  setIsAiGenerating: (isGenerating: boolean) => void;
+  signal: AbortSignal;
+  notebookTracker: INotebookTracker | null;
+}
+
+// 生成 Chat Prompt 参数接口
+export interface IGenerateChatPromptParams {
+  lastContent: string;
+  setReferenceSource: Dispatch<SetStateAction<string>>;
+  notebookTracker: INotebookTracker | null;
+  topSimilarities?: string[];
+  activeCellCode?: string;
+  selectedCode?: string;
+}
+
 export const CHAT_SYSTEM_MESSAGE =
   'You are a helpful assistant. Your name is Pretzel. You are an expert in Juypter Notebooks, Data Science, and Data Analysis. You always output markdown. All Python code MUST BE in a FENCED CODE BLOCK with language-specific highlighting. ';
 
@@ -73,8 +132,8 @@ ${topSimilarities.join('\n```\n```python\n')}
   return output;
 };
 
-const processMessages = (messages: any[], provider: string, model: string): any[] => {
-  const processedMessages: any[] = [];
+const processMessages = (messages: IChatMessage[], provider: string, model: string): IChatMessage[] => {
+  const processedMessages: IChatMessage[] = [];
 
   for (const message of messages) {
     if (!Array.isArray(message.content)) {
@@ -84,31 +143,27 @@ const processMessages = (messages: any[], provider: string, model: string): any[
 
     if (provider !== 'OpenAI' && provider !== 'Anthropic' && provider !== 'Pretzel AI') {
       // If the provider doesn't support images, only keep the text content
-      const textContent = message.content.find(item => item.type === 'text')?.text || '';
+      const textContent = (message.content as TMessageContentItem[]).find(item => item.type === 'text')?.text || '';
       processedMessages.push({ ...message, content: textContent });
       continue;
     }
 
     // Process messages for image-supporting models
-    let processedContent: any[] = [];
-    for (const item of message.content) {
+    let processedContent: TMessageContentItem[] = [];
+    for (const item of message.content as TMessageContentItem[]) {
       if (item.type === 'text') {
         processedContent.push({ type: 'text', text: item.text });
       } else if (item.type === 'image') {
         if (provider === 'Anthropic') {
           processedContent.push({
             type: 'image',
-            source: {
-              type: 'base64',
-              media_type: item.data.split(',')[0].split(':')[1].split(';')[0],
-              data: item.data.split(',')[1]
-            }
-          });
+            data: item.data
+          } as IMessageContentImage);
         } else if (provider === 'OpenAI' || provider === 'Pretzel AI') {
           processedContent.push({
             type: 'image_url',
             image_url: { url: item.data }
-          });
+          } as IMessageContentImageUrl);
         } else {
           throw new Error('Invalid provider');
         }
@@ -119,49 +174,29 @@ const processMessages = (messages: any[], provider: string, model: string): any[
   return processedMessages;
 };
 
-export const chatAIStream = async ({
-  aiChatModelProvider,
-  aiChatModelString,
-  openAiApiKey,
-  openAiBaseUrl,
-  azureBaseUrl,
-  azureApiKey,
-  deploymentId,
-  mistralApiKey,
-  anthropicApiKey,
-  ollamaBaseUrl,
-  groqApiKey,
-  renderChat,
-  messages,
-  topSimilarities,
-  activeCellCode,
-  selectedCode,
-  setReferenceSource,
-  setIsAiGenerating,
-  signal,
-  notebookTracker
-}: {
-  aiChatModelProvider: string;
-  aiChatModelString: string;
-  openAiApiKey?: string;
-  openAiBaseUrl?: string;
-  azureBaseUrl?: string;
-  azureApiKey?: string;
-  deploymentId?: string;
-  mistralApiKey?: string;
-  anthropicApiKey?: string;
-  ollamaBaseUrl?: string;
-  groqApiKey?: string;
-  renderChat: (message: string) => void;
-  messages: any[]; // types are too complex
-  topSimilarities: string[];
-  activeCellCode?: string;
-  selectedCode?: string;
-  setReferenceSource: Dispatch<SetStateAction<string>>;
-  setIsAiGenerating: (isGenerating: boolean) => void;
-  signal: AbortSignal;
-  notebookTracker: INotebookTracker | null;
-}): Promise<void> => {
+export const chatAIStream = async (params: IChatAIStreamParams): Promise<void> => {
+  const {
+    aiChatModelProvider,
+    aiChatModelString,
+    openAiApiKey,
+    openAiBaseUrl,
+    azureBaseUrl,
+    azureApiKey,
+    deploymentId,
+    mistralApiKey,
+    anthropicApiKey,
+    ollamaBaseUrl,
+    groqApiKey,
+    renderChat,
+    messages,
+    topSimilarities,
+    activeCellCode,
+    selectedCode,
+    setReferenceSource,
+    setIsAiGenerating,
+    signal,
+    notebookTracker
+  } = params;
   const lastMessageContent = messages[messages.length - 1].content;
 
   // FIXME: This should be handled at each provider level, this is a workaround

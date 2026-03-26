@@ -51,6 +51,29 @@ import { debounce } from 'lodash';
 import { PretzelSettings } from './components/PretzelSettings';
 import { isPretzelAIHostedVersion } from './utils';
 
+// 定时器管理器，用于清理所有定时器
+class TimeoutManager {
+  private timeouts: Set<NodeJS.Timeout> = new Set();
+
+  setTimeout(callback: (...args: any[]) => void, delay: number): NodeJS.Timeout {
+    const timeout = setTimeout(callback, delay);
+    this.timeouts.add(timeout);
+    return timeout;
+  }
+
+  clearTimeout(timeout: NodeJS.Timeout): void {
+    clearTimeout(timeout);
+    this.timeouts.delete(timeout);
+  }
+
+  clearAll(): void {
+    this.timeouts.forEach(timeout => clearTimeout(timeout));
+    this.timeouts.clear();
+  }
+}
+
+const timeoutManager = new TimeoutManager();
+
 function initializePosthog(cookiesEnabled: boolean, fullTelemetry: boolean) {
   if (isPretzelAIHostedVersion && fullTelemetry) {
     posthog.init('phc_FnIUQkcrbS8sgtNFHp5kpMkSvL5ydtO1nd9mPllRQqZ', {
@@ -332,7 +355,7 @@ const extension: JupyterFrontEndPlugin<void> = {
 
     const initializePromptHistory = async () => {
       if (!notebookTracker.currentWidget?.model) {
-        setTimeout(initializePromptHistory, 1000);
+        timeoutManager.setTimeout(initializePromptHistory, 1000);
         return;
       }
       const savedHistory = await loadPromptHistory(app, notebookTracker);
@@ -426,7 +449,7 @@ const extension: JupyterFrontEndPlugin<void> = {
     app.serviceManager.contents.fileChanged.connect((sender, change) => {
       if (change.type === 'rename') {
         // wait for the file to be renamed before creating embeddings file
-        setTimeout(() => {
+        timeoutManager.setTimeout(() => {
           getEmbeddings(notebookTracker, app, aiClient, aiChatModelProvider);
         }, 2000);
       }
@@ -459,9 +482,9 @@ const extension: JupyterFrontEndPlugin<void> = {
       if (cell) {
         cell.model.contentChanged.connect(() => {
           if (debounceTimeout) {
-            clearTimeout(debounceTimeout);
+            timeoutManager.clearTimeout(debounceTimeout);
           }
-          debounceTimeout = setTimeout(() => {
+          debounceTimeout = timeoutManager.setTimeout(() => {
             getEmbeddings(notebookTracker, app, aiClient, aiChatModelProvider);
           }, 1000);
         });
@@ -762,7 +785,7 @@ const extension: JupyterFrontEndPlugin<void> = {
 
     function initSidePanel() {
       const labShell = app.shell as ILabShell;
-      const sidePanel = Array.from(labShell.widgets('right')).find(widget => widget.id === 'pretzelai-chat-panel');
+      const sidePanel = Array.from(labShell.widgets('right')).find(widget => (widget as any).id === 'pretzelai-chat-panel') as any;
       const wasExpanded = sidePanel?.isVisible || false;
 
       if (sidePanel) {
@@ -778,7 +801,7 @@ const extension: JupyterFrontEndPlugin<void> = {
 
     function toggleChatPanel() {
       const labShell = app.shell as ILabShell;
-      const sidePanel = Array.from(labShell.widgets('right')).find(widget => widget.id === 'pretzelai-chat-panel');
+      const sidePanel = Array.from(labShell.widgets('right')).find(widget => (widget as any).id === 'pretzelai-chat-panel') as any;
       const wasExpanded = sidePanel?.isVisible || false;
 
       if (sidePanel) {
@@ -798,8 +821,8 @@ const extension: JupyterFrontEndPlugin<void> = {
         // Ensure the side panel is focused after creation
         requestAnimationFrame(() => {
           const newlyCreatedPanel = Array.from(labShell.widgets('right')).find(
-            widget => widget.id === 'pretzelai-chat-panel'
-          );
+            widget => (widget as any).id === 'pretzelai-chat-panel'
+          ) as any;
           if (newlyCreatedPanel) {
             const inputArea = newlyCreatedPanel.node.querySelector('textarea');
             inputArea?.focus();
