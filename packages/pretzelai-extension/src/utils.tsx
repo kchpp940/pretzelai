@@ -23,100 +23,42 @@ import Groq from 'groq-sdk';
 import { IKernelConnection } from '@jupyterlab/services/src/kernel/kernel';
 import * as monaco from 'monaco-editor';
 import { globalState } from './globalState';
-import { IChatMessage } from './chatAIUtils';
-
-// Notebook Cell 接口
-export interface INotebookCell {
-  id: string;
-  source: string;
-}
-
-// AI 响应流项接口
-export interface IAIStreamChoice {
-  delta: {
-    content?: string;
-  };
-}
-
-export interface IAIStreamItem {
-  choices: IAIStreamChoice[];
-}
-
-// AI 消息内容接口
-export interface IAIMessageContentText {
-  type: 'text';
-  text: string;
-}
-
-export interface IAIMessageContentImageUrl {
-  type: 'image_url';
-  image_url: { url: string };
-}
-
-export type TAIMessageContent = string | (IAIMessageContentText | IAIMessageContentImageUrl)[];
-
-// Provider 配置接口
-export interface IProviderConfig {
-  modelProvider: string;
-  modelString: string;
-}
-
-// Setup Stream 参数接口
-export interface ISetupStreamParams {
-  aiChatModelProvider: string;
-  aiChatModelString: string;
-  openAiApiKey?: string;
-  openAiBaseUrl?: string;
-  prompt: string;
-  base64Images: string[];
-  azureBaseUrl?: string;
-  azureApiKey?: string;
-  deploymentId?: string;
-  mistralApiKey?: string;
-  mistralModel?: string;
-  anthropicApiKey?: string;
-  ollamaBaseUrl?: string;
-  groqApiKey?: string;
-}
-
-// Generate AI Stream 参数接口
-export interface IGenerateAIStreamParams extends ISetupStreamParams {
-  aiClient: OpenAI | OpenAIClient | MistralClient | null;
-  embeddings: Embedding[];
-  userInput: string;
-  oldCodeForPrompt: string;
-  traceback: string;
-  notebookTracker: INotebookTracker;
-  codeMatchThreshold: number;
-  numberOfSimilarCells: number;
-  posthogPromptTelemetry: boolean;
-  isInject: boolean;
-}
 
 export const PLUGIN_ID = '@jupyterlab/pretzelai-extension:plugin';
 
-// 定时器管理器实例，用于清理所有定时器
-class TimeoutManager {
-  private timeouts: Set<NodeJS.Timeout> = new Set();
-
-  setTimeout(callback: (...args: any[]) => void, delay: number): NodeJS.Timeout {
-    const timeout = setTimeout(callback, delay);
-    this.timeouts.add(timeout);
-    return timeout;
-  }
-
-  clearTimeout(timeout: NodeJS.Timeout): void {
-    clearTimeout(timeout);
-    this.timeouts.delete(timeout);
-  }
-
-  clearAll(): void {
-    this.timeouts.forEach(timeout => clearTimeout(timeout));
-    this.timeouts.clear();
-  }
+export interface AIProviderConfig {
+  apiKey?: string;
+  baseUrl?: string;
+  deploymentName?: string;
 }
 
-export const timeoutManager = new TimeoutManager();
+export interface EmbeddingResponse {
+  data: Array<{
+    embedding: number[];
+  }>;
+}
+
+export interface StreamCompletionChunk {
+  choices: Array<{
+    delta: {
+      content?: string;
+    };
+    text?: string;
+  }>;
+}
+
+export interface NotebookCell {
+  id: string;
+  source: string;
+  cell_type?: string;
+}
+
+export interface ContentsFile {
+  name: string;
+  path: string;
+  type: string;
+  content?: ContentsFile[];
+}
 
 export async function calculateHash(input: string) {
   const encoder = new TextEncoder();
@@ -184,9 +126,7 @@ export async function executeCode(kernel: IKernelConnection, code: string): Prom
   if (reply && reply.content.status === 'ok') {
     return variableValue;
   } else {
-    const errorMessage = 'Failed to retrieve variable value';
-    console.error(errorMessage);
-    showErrorDialog('Variable Retrieval Error', errorMessage);
+    console.error('Failed to retrieve variable value');
     return null;
   }
 }
@@ -201,15 +141,11 @@ export async function getVariableValue(
     try {
       return await executeCode(kernel, `print(${variableName})`);
     } catch (error) {
-      const errorMessage = `Error retrieving variable value: ${error instanceof Error ? error.message : 'Unknown error'}`;
-      console.error(errorMessage);
-      showErrorDialog('Variable Retrieval Error', errorMessage);
+      console.error('Error retrieving variable value:', error);
       return null;
     }
   } else {
-    const errorMessage = 'No active kernel found';
-    console.error(errorMessage);
-    showErrorDialog('Kernel Error', errorMessage);
+    console.error('No active kernel found');
     return null;
   }
 }
@@ -281,9 +217,7 @@ export async function processVariables(
       }
       processedInput = processedInput.replace(`@${variableName}`, `\`${variableName}\``);
     } catch (error) {
-      const errorMessage = `Error accessing variable ${variableName}: ${error instanceof Error ? error.message : 'Unknown error'}`;
-      console.error(errorMessage);
-      // 变量访问错误通常不需要弹窗打扰用户，只记录到控制台
+      console.error(`Error accessing variable ${variableName}:`, error);
     }
   }
 
@@ -335,7 +269,7 @@ export const PRETZEL_FOLDER = '.pretzel';
 
 export async function createAndSaveEmbeddings(
   existingEmbeddingsJSON: Embedding[],
-  cells: INotebookCell[],
+  cells: NotebookCell[],
   path: string,
   app: JupyterFrontEnd,
   aiClient: OpenAI | OpenAIClient | MistralClient | null,
@@ -361,6 +295,7 @@ export async function createAndSaveEmbeddings(
               });
             } catch (error) {
               console.error('Error generating embedding:', error);
+              showErrorDialog('Error generating embedding', error instanceof Error ? error.message : String(error));
             }
           } else {
             newEmbeddingsArray.push(embeddings[index]);
@@ -377,6 +312,7 @@ export async function createAndSaveEmbeddings(
             });
           } catch (error) {
             console.error('Error generating embedding:', error);
+            showErrorDialog('Error generating embedding', error instanceof Error ? error.message : String(error));
           }
         }
       })();
@@ -402,7 +338,8 @@ export async function getEmbeddings(
   notebookTracker: INotebookTracker,
   app: JupyterFrontEnd,
   aiClient: OpenAI | OpenAIClient | MistralClient | null,
-  aiChatModelProvider: string
+  aiChatModelProvider: string,
+  retryTimer?: { current: ReturnType<typeof setTimeout> | null }
 ): Promise<Embedding[]> {
   const notebook = notebookTracker.currentWidget;
   let embeddings: Embedding[] = [];
@@ -433,9 +370,8 @@ export async function getEmbeddings(
           aiChatModelProvider
         );
       } catch (error) {
-        const errorMessage = `Error parsing embeddings JSON: ${error instanceof Error ? error.message : 'Unknown error'}`;
-        console.error(errorMessage);
-        // 嵌入解析错误通常不影响核心功能，只记录日志
+        console.error('Error parsing embeddings JSON:', error);
+        showErrorDialog('Error parsing embeddings', error instanceof Error ? error.message : String(error));
       }
     } else {
       // create directory. if already exists, this code does nothing
@@ -454,7 +390,7 @@ export async function getEmbeddings(
       try {
         const response = await ServerConnection.makeRequest(requestUrl, init, app.serviceManager.serverSettings);
         if (!response.ok) {
-          throw new Error(`Error creating directory: ${response.statusText}`);
+          throw new Error(`Error creating directory: ${response}`);
         }
         await app.serviceManager.contents.save(embeddingsPath, {
           type: 'file',
@@ -462,16 +398,17 @@ export async function getEmbeddings(
           content: JSON.stringify([])
         });
       } catch (error) {
-        const errorMessage = `Error creating embeddings: ${error instanceof Error ? error.message : 'Unknown error'}`;
-        console.error(errorMessage);
-        showErrorDialog('Embeddings Error', errorMessage);
+        console.error('Error creating embeddings:', error);
+        showErrorDialog('Error creating embeddings', error instanceof Error ? error.message : String(error));
       }
     }
   } else {
-    timeoutManager.setTimeout(() => getEmbeddings(notebookTracker, app, aiClient, aiChatModelProvider), 1000);
+    if (retryTimer) {
+      retryTimer.current = setTimeout(() => getEmbeddings(notebookTracker, app, aiClient, aiChatModelProvider, retryTimer), 1000);
+    }
   }
   return embeddings;
-};
+}
 
 export const readEmbeddings = async (
   notebookTracker: INotebookTracker,
@@ -524,38 +461,50 @@ export const getTopSimilarities = async (
     .map(e => embeddings[e.index].source);
 };
 
-const setupStream = async (params: ISetupStreamParams): Promise<AsyncIterable<IAIStreamItem>> => {
-  const {
-    aiChatModelProvider,
-    aiChatModelString,
-    openAiApiKey,
-    openAiBaseUrl,
-    prompt,
-    base64Images,
-    azureBaseUrl,
-    azureApiKey,
-    deploymentId,
-    mistralApiKey,
-    mistralModel,
-    anthropicApiKey,
-    ollamaBaseUrl,
-    groqApiKey
-  } = params;
-
-  let stream: AsyncIterable<IAIStreamItem> | null = null;
-  let content: TAIMessageContent = prompt;
+const setupStream = async ({
+  aiChatModelProvider,
+  aiChatModelString,
+  openAiApiKey,
+  openAiBaseUrl,
+  prompt,
+  base64Images,
+  azureBaseUrl,
+  azureApiKey,
+  deploymentId,
+  mistralApiKey,
+  mistralModel,
+  anthropicApiKey,
+  ollamaBaseUrl,
+  groqApiKey
+}: {
+  aiChatModelProvider: string;
+  aiChatModelString: string;
+  openAiApiKey?: string;
+  openAiBaseUrl?: string;
+  prompt: string;
+  base64Images: string[];
+  azureBaseUrl?: string;
+  azureApiKey?: string;
+  deploymentId?: string;
+  mistralApiKey?: string;
+  mistralModel?: string;
+  anthropicApiKey?: string;
+  ollamaBaseUrl?: string;
+  groqApiKey?: string;
+}): Promise<AsyncIterable<any>> => {
+  let stream: AsyncIterable<any> | null = null;
+  let content: string | any[] = prompt; // FIXME: any is pretty complex here, leaving it for now
   if (base64Images.length > 0) {
     if (aiChatModelProvider === 'OpenAI' || aiChatModelProvider === 'Pretzel AI') {
       content = [
-        { type: 'text' as const, text: prompt },
-        ...base64Images.map(image => ({ type: 'image_url' as const, image_url: { url: image } }))
+        { type: 'text', text: prompt },
+        ...base64Images.map(image => ({ type: 'image_url', image_url: { url: image } }))
       ];
     } else if (aiChatModelProvider === 'Anthropic') {
-      // 对于 Anthropic，我们需要使用不同的格式
-      const anthropicContent: any = [
-        { type: 'text' as const, text: prompt },
+      content = [
+        { type: 'text', text: prompt },
         ...base64Images.map(image => ({
-          type: 'image' as const,
+          type: 'image',
           source: {
             type: 'base64',
             media_type: image.split(',')[0].split(':')[1].split(';')[0],
@@ -563,7 +512,6 @@ const setupStream = async (params: ISetupStreamParams): Promise<AsyncIterable<IA
           }
         }))
       ];
-      content = anthropicContent;
     }
   }
 
@@ -573,11 +521,11 @@ const setupStream = async (params: ISetupStreamParams): Promise<AsyncIterable<IA
       dangerouslyAllowBrowser: true,
       baseURL: openAiBaseUrl ? openAiBaseUrl : undefined
     });
-    stream = (await openai.chat.completions.create({
+    stream = await openai.chat.completions.create({
       model: aiChatModelString,
       messages: [{ role: 'user', content: content }],
       stream: true
-    })) as unknown as AsyncIterable<IAIStreamItem>;
+    });
   } else if (aiChatModelProvider === 'Pretzel AI') {
     const response = await fetch('https://api.pretzelai.app/prompt/', {
       method: 'POST',
@@ -626,11 +574,9 @@ const setupStream = async (params: ISetupStreamParams): Promise<AsyncIterable<IA
     };
   } else if (aiChatModelProvider === 'Mistral' && mistralApiKey && aiChatModelString && content) {
     const client = new MistralClient(mistralApiKey);
-    // Mistral 只支持字符串内容
-    const stringContent = typeof content === 'string' ? content : prompt;
     const chatStream = await client.chatStream({
       model: aiChatModelString,
-      messages: [{ role: 'user', content: stringContent }]
+      messages: [{ role: 'user', content: content }]
     });
 
     stream = {
@@ -641,12 +587,11 @@ const setupStream = async (params: ISetupStreamParams): Promise<AsyncIterable<IA
       }
     };
   } else if (aiChatModelProvider === 'Anthropic' && anthropicApiKey && aiChatModelString && content) {
-    const messages = [{ role: 'user' as const, content: content }];
-    const streamResult = await streamAnthropicCompletion(anthropicApiKey, messages as IChatMessage[], aiChatModelString);
-    return streamResult;
+    const messages = [{ role: 'user', content: content }];
+    const stream = await streamAnthropicCompletion(anthropicApiKey, messages, aiChatModelString);
+
+    return stream;
   } else if (aiChatModelProvider === 'Ollama' && ollamaBaseUrl && aiChatModelString && content) {
-    // Ollama 只支持字符串内容
-    const stringContent = typeof content === 'string' ? content : prompt;
     const response = await fetch(`${ollamaBaseUrl}/api/chat`, {
       method: 'POST',
       headers: {
@@ -654,7 +599,7 @@ const setupStream = async (params: ISetupStreamParams): Promise<AsyncIterable<IA
       },
       body: JSON.stringify({
         model: aiChatModelString,
-        messages: [{ role: 'user', content: stringContent }],
+        messages: [{ role: 'user', content: content }],
         stream: true
       })
     });
@@ -691,7 +636,7 @@ const setupStream = async (params: ISetupStreamParams): Promise<AsyncIterable<IA
 
     stream = {
       async *[Symbol.asyncIterator]() {
-        for await (const chunk of chatStream as any) {
+        for await (const chunk of chatStream) {
           yield { choices: [{ delta: { content: chunk.choices[0]?.delta?.content || '' } }] };
         }
       }
@@ -703,32 +648,55 @@ const setupStream = async (params: ISetupStreamParams): Promise<AsyncIterable<IA
   return stream;
 };
 
-export const generateAIStream = async (params: IGenerateAIStreamParams): Promise<AsyncIterable<IAIStreamItem>> => {
-  const {
-    aiChatModelProvider,
-    aiChatModelString,
-    aiClient,
-    embeddings,
-    userInput,
-    base64Images,
-    oldCodeForPrompt,
-    traceback,
-    notebookTracker,
-    codeMatchThreshold,
-    numberOfSimilarCells,
-    posthogPromptTelemetry,
-    openAiApiKey,
-    openAiBaseUrl,
-    azureBaseUrl,
-    azureApiKey,
-    deploymentId,
-    mistralApiKey,
-    mistralModel,
-    anthropicApiKey,
-    ollamaBaseUrl,
-    groqApiKey,
-    isInject
-  } = params;
+export const generateAIStream = async ({
+  aiChatModelProvider,
+  aiChatModelString,
+  aiClient,
+  embeddings,
+  userInput,
+  base64Images,
+  oldCodeForPrompt,
+  traceback,
+  notebookTracker,
+  codeMatchThreshold,
+  numberOfSimilarCells,
+  posthogPromptTelemetry,
+  openAiApiKey,
+  openAiBaseUrl,
+  azureBaseUrl,
+  azureApiKey,
+  deploymentId,
+  mistralApiKey,
+  mistralModel,
+  anthropicApiKey,
+  ollamaBaseUrl,
+  groqApiKey,
+  isInject
+}: {
+  aiChatModelProvider: string;
+  aiChatModelString: string;
+  aiClient: OpenAI | OpenAIClient | MistralClient | null;
+  embeddings: Embedding[];
+  userInput: string;
+  base64Images: string[];
+  oldCodeForPrompt: string;
+  traceback: string;
+  notebookTracker: INotebookTracker;
+  codeMatchThreshold: number;
+  numberOfSimilarCells: number;
+  posthogPromptTelemetry: boolean;
+  openAiApiKey: string;
+  openAiBaseUrl: string;
+  azureBaseUrl: string;
+  azureApiKey: string;
+  deploymentId: string;
+  mistralApiKey: string;
+  mistralModel: string;
+  anthropicApiKey: string;
+  ollamaBaseUrl: string;
+  groqApiKey: string;
+  isInject: boolean;
+}): Promise<AsyncIterable<any>> => {
   const { extractedCode } = getSelectedCode(notebookTracker);
   const topSimilarities = await getTopSimilarities(
     traceback ? oldCodeForPrompt : userInput,
@@ -823,9 +791,8 @@ export class FixedSizeStack<T> {
 export async function deleteExistingEmbeddings(app: JupyterFrontEnd, notebookTracker: INotebookTracker) {
   const notebook = notebookTracker.currentWidget;
   if (!notebook) {
-    const errorMessage = 'No active notebook found';
-    console.error(errorMessage);
-    showErrorDialog('Notebook Error', errorMessage);
+    console.error('No active notebook found');
+    showErrorDialog('No active notebook', 'Please open a notebook to delete embeddings.');
     return;
   }
 
@@ -836,7 +803,9 @@ export async function deleteExistingEmbeddings(app: JupyterFrontEnd, notebookTra
   try {
     // List all files in the directory
     const fileList = await app.serviceManager.contents.get(embeddingsDir, { content: true });
-    const embeddingsFiles = fileList.content.filter((file: any) => file.name.endsWith('_embeddings.json'));
+    const embeddingsFiles = (fileList.content as ContentsFile[]).filter(file =>
+      file.name.endsWith('_embeddings.json')
+    );
 
     // Delete each embeddings file
     for (const file of embeddingsFiles) {
@@ -844,9 +813,8 @@ export async function deleteExistingEmbeddings(app: JupyterFrontEnd, notebookTra
     }
     console.log('All embeddings files deleted successfully');
   } catch (error) {
-    const errorMessage = `Error deleting embeddings files: ${error instanceof Error ? error.message : 'Unknown error'}`;
-    console.error(errorMessage);
-    showErrorDialog('Embeddings Error', errorMessage);
+    console.error('Error deleting embeddings files:', error);
+    showErrorDialog('Error deleting embeddings', error instanceof Error ? error.message : String(error));
   }
 }
 
@@ -857,10 +825,11 @@ export async function getCookie(name: string): Promise<string> {
 
 export async function streamAnthropicCompletion(
   apiKey: string,
-  messages: IChatMessage[],
+  messages: Array<{ role: string; content: unknown }>,
   model: string = 'claude-3-5-sonnet-20240620',
-  maxTokens: number = 4096
-): Promise<AsyncIterable<IAIStreamItem>> {
+  maxTokens: number = 4096,
+  signal?: AbortSignal
+): Promise<AsyncIterable<StreamCompletionChunk>> {
   const xsrfToken = await getCookie('_xsrf');
   const baseUrl = ServerConnection.makeSettings().baseUrl;
   const fullUrl = URLExt.join(baseUrl, '/anthropic/complete');
@@ -876,7 +845,8 @@ export async function streamAnthropicCompletion(
       messages: messages,
       max_tokens: maxTokens,
       model: model
-    })
+    }),
+    signal
   });
 
   const reader = response.body!.getReader();
@@ -885,6 +855,9 @@ export async function streamAnthropicCompletion(
   return {
     async *[Symbol.asyncIterator]() {
       while (true) {
+        if (signal?.aborted) {
+          break;
+        }
         const { value, done } = await reader.read();
         if (done) break;
 
@@ -983,8 +956,7 @@ export async function savePromptHistory(
         content: JSON.stringify(existingPromptHistory)
       });
     } catch (error) {
-      const errorMessage = `Error parsing prompt history: ${error instanceof Error ? error.message : 'Unknown error'}`;
-      console.error(errorMessage);
+      console.error('Error parsing embeddings JSON:', error);
       // something is broken with the file, update it with the new prompt history
       await app.serviceManager.contents.save(promptHistoryPath, {
         type: 'file',
@@ -1029,14 +1001,11 @@ export async function savePromptHistory(
             })
           });
         } catch (error) {
-          const errorMessage = `Error saving prompt history: ${error instanceof Error ? error.message : 'Unknown error'}`;
-          console.error(errorMessage);
+          console.error('Error saving prompt history:', error);
         }
       } // end of else
     } catch (error) {
-      const errorMessage = `Error creating directory: ${error instanceof Error ? error.message : 'Unknown error'}`;
-      console.error(errorMessage);
-      showErrorDialog('Directory Error', errorMessage);
+      console.error('Error creating directory:', error);
     }
   }
 }
@@ -1061,8 +1030,7 @@ export async function loadPromptHistory(
     // file does not exist or the JSON is malformed
     // we do nothing here - the user will see an empty prompt history
     // the file will be created/updated on the next save
-    const errorMessage = `Error loading prompt history: ${error instanceof Error ? error.message : 'Unknown error'}`;
-    console.error(errorMessage);
+    console.error('Error loading prompt history:', error);
     return [];
   }
 }

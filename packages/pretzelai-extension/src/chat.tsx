@@ -25,7 +25,7 @@ import { OpenAI } from 'openai';
 import posthog from 'posthog-js';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import pretzelSvg from '../style/icons/pretzel.svg';
-import { CHAT_SYSTEM_MESSAGE, chatAIStream } from './chatAIUtils';
+import { CHAT_SYSTEM_MESSAGE, chatAIStream, ChatMessage } from './chatAIUtils';
 import { RendermimeMarkdown } from './components/rendermime-markdown';
 import { globalState } from './globalState';
 import { getDefaultSettings } from './migrations/defaultSettings';
@@ -35,8 +35,7 @@ import {
   getSelectedCode,
   getTopSimilarities,
   PRETZEL_FOLDER,
-  readEmbeddings,
-  timeoutManager
+  readEmbeddings
 } from './utils';
 import { providersInfo } from './migrations/providerInfo';
 import { ImagePreview } from './components/ImagePreview';
@@ -119,6 +118,7 @@ export function Chat({
   const [hoveredImage, setHoveredImage] = useState<string | null>(null);
   const [canBeUsedForImages, setCanBeUsedForImages] = useState(false);
   const canBeUsedForImagesRef = useRef(false);
+  const fetchChatHistoryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     const currentSettingsVersion = pretzelSettingsJSON?.version;
@@ -134,7 +134,7 @@ export function Chat({
   const fetchChatHistory = async () => {
     const notebook = notebookTracker?.currentWidget;
     if (!notebook?.model) {
-      timeoutManager.setTimeout(fetchChatHistory, 1000);
+      fetchChatHistoryTimer.current = setTimeout(fetchChatHistory, 1000);
       return;
     }
     if (notebook?.model && !isAiGenerating) {
@@ -223,9 +223,10 @@ export function Chat({
       fetchChatHistory();
     });
 
-    // 组件卸载时清理所有定时器
     return () => {
-      timeoutManager.clearAll();
+      if (fetchChatHistoryTimer.current) {
+        clearTimeout(fetchChatHistoryTimer.current);
+      }
     };
   }, []);
 
@@ -323,15 +324,18 @@ export function Chat({
     setMessages(prevMessages => {
       const updatedMessages = [...prevMessages, newMessage as IMessage];
 
-      const formattedMessages = [
+      const formattedMessages: ChatMessage[] = [
         {
           role: 'system',
           content: CHAT_SYSTEM_MESSAGE
         },
-        ...updatedMessages.map(msg => ({
-          role: msg.role,
-          content: msg.content
-        }))
+        ...updatedMessages.map(
+          msg =>
+            ({
+              role: msg.role,
+              content: msg.content
+            }) as ChatMessage
+        )
       ];
 
       (async () => {
@@ -408,15 +412,18 @@ export function Chat({
     setMessages(prevMessages => {
       const updatedMessages = [...prevMessages, newMessage as IMessage];
 
-      const formattedMessages = [
+      const formattedMessages: ChatMessage[] = [
         {
           role: 'system',
           content: CHAT_SYSTEM_MESSAGE
         },
-        ...updatedMessages.map(msg => ({
-          role: msg.role,
-          content: msg.content
-        }))
+        ...updatedMessages.map(
+          msg =>
+            ({
+              role: msg.role,
+              content: msg.content
+            }) as ChatMessage
+        )
       ];
 
       (async () => {
