@@ -49,24 +49,7 @@ export class PretzelInlineProvider implements IInlineCompletionProvider {
   readonly name = 'Pretzel AI inline completion';
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private abortController: AbortController | null = null;
-  private isDisposed = false;
-
-  public dispose(): void {
-    if (this.isDisposed) {
-      return;
-    }
-    this.isDisposed = true;
-
-    if (this.debounceTimer) {
-      clearTimeout(this.debounceTimer);
-      this.debounceTimer = null;
-    }
-
-    if (this.abortController) {
-      this.abortController.abort();
-      this.abortController = null;
-    }
-  }
+  private _isDisposed = false;
 
   private _prefixFromRequest(request: CompletionHandler.IRequest): string {
     const currentCellIndex = this.notebookTracker?.currentWidget?.model!.sharedModel.cells.findIndex(
@@ -155,7 +138,7 @@ export class PretzelInlineProvider implements IInlineCompletionProvider {
     // Create new AbortController for this fetch
     this.abortController = new AbortController();
 
-    if (this.debounceTimer !== null) {
+    if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
     }
     const settings = await this.settingRegistry.load(PLUGIN_ID);
@@ -183,11 +166,6 @@ export class PretzelInlineProvider implements IInlineCompletionProvider {
 
     return new Promise(resolve => {
       this.debounceTimer = setTimeout(async () => {
-        if (this.isDisposed) {
-          resolve({ items: [] });
-          return;
-        }
-
         this.isFetchingChanged.emit(true);
 
         let prompt = this._prefixFromRequest(request);
@@ -285,13 +263,16 @@ export class PretzelInlineProvider implements IInlineCompletionProvider {
                   stop: stops,
                   max_tokens: 500,
                   temperature: 0
-                }),
-                signal: this.abortController?.signal
+                })
               });
               // Note: Response parsing might not work as expected due to 'no-cors' mode, which can lead to an opaque response.
               completion = (await data.json()).choices[0].message.content;
             } else {
               const mistral = new MistralClient(mistralApiKey);
+              // Check if aborted before making the request
+              if (this.abortController?.signal.aborted) {
+                throw new Error('AbortError');
+              }
               const mistralResponse = await mistral.chat({
                 model: copilotModel,
                 messages: [
@@ -318,17 +299,14 @@ export class PretzelInlineProvider implements IInlineCompletionProvider {
           } else if (copilotProvider === 'Anthropic' && anthropicApiKey) {
             const messages = [
               {
-                role: 'user',
+                role: 'user' as const,
                 content: getInlinePrompt(prompt, suffix)
               }
             ];
-            const stream = await streamAnthropicCompletion(anthropicApiKey, messages, copilotModel, 500, this.abortController?.signal);
+            const stream = await streamAnthropicCompletion(anthropicApiKey, messages, copilotModel, 500);
             let completionContent = '';
             for await (const chunk of stream) {
-              if (this.isDisposed) {
-                break;
-              }
-              completionContent += chunk.choices[0]?.delta?.content || '';
+              completionContent += chunk.choices[0].delta.content;
             }
             completion = completionContent.trim();
           } else if (copilotProvider === 'Ollama' && ollamaBaseUrl) {
@@ -407,8 +385,8 @@ export class PretzelInlineProvider implements IInlineCompletionProvider {
               }
             ]
           });
-        } catch (error: any) {
-          if (error.name === 'AbortError') {
+        } catch (error: unknown) {
+          if (error instanceof Error && error.name === 'AbortError') {
             console.log('Fetch aborted');
           } else {
             console.error('Error:', JSON.stringify(error));
@@ -422,5 +400,34 @@ export class PretzelInlineProvider implements IInlineCompletionProvider {
         }
       }, DEBOUNCE_TIME);
     });
+  }
+
+  /**
+   * Dispose the provider and cancel any pending requests
+   */
+  dispose(): void {
+    if (this._isDisposed) {
+      return;
+    }
+    this._isDisposed = true;
+
+    // Cancel any pending debounce timer
+    if (this.debounceTimer) {
+      clearTimeout(this.debounceTimer);
+      this.debounceTimer = null;
+    }
+
+    // Abort any in-flight requests
+    if (this.abortController) {
+      this.abortController.abort();
+      this.abortController = null;
+    }
+  }
+
+  /**
+   * Check if the provider has been disposed
+   */
+  get isDisposed(): boolean {
+    return this._isDisposed;
   }
 }

@@ -11,55 +11,30 @@ import { AzureKeyCredential, OpenAIClient } from '@azure/openai';
 import { OpenAI } from 'openai';
 import { ChatCompletionMessage } from 'openai/resources';
 import MistralClient, { Message } from '@mistralai/mistralai';
-import { streamAnthropicCompletion } from './utils';
+import { streamAnthropicCompletion, AIMessage, StreamChunk } from './utils';
 import Groq from 'groq-sdk';
 import { ChatCompletionMessageParam } from 'groq-sdk/resources/chat/completions';
 import { processVariables } from './utils';
 import { INotebookTracker } from '@jupyterlab/notebook';
 import { Dispatch, SetStateAction } from 'react';
 
-export interface TextContent {
+// Type for message content items
+interface TextContentItem {
   type: 'text';
   text: string;
 }
 
-export interface ImageContent {
+interface ImageContentItem {
   type: 'image';
   data: string;
 }
 
-export interface OpenAIImageContent {
-  type: 'image_url';
-  image_url: { url: string };
-}
+type MessageContentItem = TextContentItem | ImageContentItem;
 
-export interface AnthropicImageContent {
-  type: 'image';
-  source: {
-    type: 'base64';
-    media_type: string;
-    data: string;
-  };
-}
-
-export type MessageContent = string | (TextContent | ImageContent)[];
-
-export interface ChatMessage {
+// Extended message type that supports array content
+interface ExtendedAIMessage {
   role: 'user' | 'assistant' | 'system';
-  content: MessageContent;
-}
-
-export interface ProcessedMessage {
-  role: 'user' | 'assistant' | 'system';
-  content: string | (TextContent | OpenAIImageContent | AnthropicImageContent)[];
-}
-
-export interface StreamChunk {
-  choices: Array<{
-    delta: {
-      content?: string;
-    };
-  }>;
+  content: string | MessageContentItem[];
 }
 
 export const CHAT_SYSTEM_MESSAGE =
@@ -117,30 +92,44 @@ ${topSimilarities.join('\n```\n```python\n')}
   return output;
 };
 
-const processMessages = (messages: ChatMessage[], provider: string, model: string): ProcessedMessage[] => {
+interface ProcessedContentItem {
+  type: string;
+  text?: string;
+  image_url?: { url: string };
+  source?: {
+    type: string;
+    media_type: string;
+    data: string;
+  };
+}
+
+interface ProcessedMessage {
+  role: 'user' | 'assistant' | 'system';
+  content: string | ProcessedContentItem[];
+}
+
+const processMessages = (messages: ExtendedAIMessage[], provider: string, model: string): ProcessedMessage[] => {
   const processedMessages: ProcessedMessage[] = [];
 
   for (const message of messages) {
     if (!Array.isArray(message.content)) {
-      processedMessages.push({
-        role: message.role,
-        content: message.content
-      });
+      processedMessages.push(message as ProcessedMessage);
       continue;
     }
 
     if (provider !== 'OpenAI' && provider !== 'Anthropic' && provider !== 'Pretzel AI') {
       // If the provider doesn't support images, only keep the text content
-      const textContent = message.content.find((item): item is TextContent => item.type === 'text')?.text || '';
-      processedMessages.push({ role: message.role, content: textContent });
+      const textItem = message.content.find((item): item is TextContentItem => item.type === 'text');
+      const textContent = textItem?.text || '';
+      processedMessages.push({ ...message, content: textContent });
       continue;
     }
 
     // Process messages for image-supporting models
-    const processedContent: (TextContent | OpenAIImageContent | AnthropicImageContent)[] = [];
+    const processedContent: ProcessedContentItem[] = [];
     for (const item of message.content) {
       if (item.type === 'text') {
-        processedContent.push({ type: 'text', text: item.text });
+        processedContent.push({ type: 'text', text: (item as TextContentItem).text });
       } else if (item.type === 'image') {
         if (provider === 'Anthropic') {
           processedContent.push({
@@ -161,7 +150,7 @@ const processMessages = (messages: ChatMessage[], provider: string, model: strin
         }
       }
     }
-    processedMessages.push({ role: message.role, content: processedContent });
+    processedMessages.push({ ...message, content: processedContent });
   }
   return processedMessages;
 };
@@ -200,7 +189,7 @@ export const chatAIStream = async ({
   ollamaBaseUrl?: string;
   groqApiKey?: string;
   renderChat: (message: string) => void;
-  messages: ChatMessage[];
+  messages: ExtendedAIMessage[];
   topSimilarities: string[];
   activeCellCode?: string;
   selectedCode?: string;
@@ -220,7 +209,7 @@ export const chatAIStream = async ({
 
   // Process the last message to add context
   const lastMessageText = Array.isArray(lastMessageContent)
-    ? (lastMessageContent[0] as TextContent).text
+    ? (lastMessageContent[0] as TextContentItem).text
     : lastMessageContent;
   const lastMessageTextWithInjection = await generateChatPrompt(
     lastMessageText,
@@ -230,10 +219,10 @@ export const chatAIStream = async ({
     activeCellCode,
     selectedCode
   );
-  const updatedLastMessageContent: MessageContent = Array.isArray(lastMessageContent)
+  const updatedLastMessageContent: string | MessageContentItem[] = Array.isArray(lastMessageContent)
     ? [{ type: 'text', text: lastMessageTextWithInjection }, ...lastMessageContent.slice(1)]
     : lastMessageTextWithInjection;
-  const updatedMessages: ChatMessage[] = [
+  const updatedMessages: ExtendedAIMessage[] = [
     ...messages.slice(0, -1),
     { role: 'user', content: updatedLastMessageContent }
   ];
@@ -329,7 +318,8 @@ export const chatAIStream = async ({
     setIsAiGenerating(false);
   } else if (aiChatModelProvider === 'Anthropic' && anthropicApiKey && aiChatModelString && messages) {
     const filteredMessages = processedMessages.filter((msg, index) => index !== 1);
-    const stream = await streamAnthropicCompletion(anthropicApiKey, filteredMessages, aiChatModelString);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const stream = await streamAnthropicCompletion(anthropicApiKey, filteredMessages as any, aiChatModelString);
 
     for await (const chunk of stream) {
       if (chunk.choices[0]?.delta?.content) {

@@ -98,6 +98,14 @@ const extension: JupyterFrontEndPlugin<void> = {
     const provider = new PretzelInlineProvider(notebookTracker, settingRegistry, app);
     providerManager.registerInlineProvider(provider);
 
+    // Clean up provider when the app is disposed
+    app.started.then(() => {
+      const cleanup = () => {
+        provider.dispose();
+      };
+      window.addEventListener('beforeunload', cleanup);
+    });
+
     provider.isFetchingChanged.connect((_, isFetching) => {
       const activeCell = notebookTracker.activeCell;
       if (activeCell) {
@@ -330,11 +338,11 @@ const extension: JupyterFrontEndPlugin<void> = {
       }
     }
 
-    let initializePromptHistoryTimer: ReturnType<typeof setTimeout> | null = null;
+    let initializePromptHistoryTimeout: NodeJS.Timeout | null = null;
 
     const initializePromptHistory = async () => {
       if (!notebookTracker.currentWidget?.model) {
-        initializePromptHistoryTimer = setTimeout(initializePromptHistory, 1000);
+        initializePromptHistoryTimeout = setTimeout(initializePromptHistory, 1000);
         return;
       }
       const savedHistory = await loadPromptHistory(app, notebookTracker);
@@ -425,13 +433,14 @@ const extension: JupyterFrontEndPlugin<void> = {
     });
 
     // getEmbeddings when a file is renamed
-    let fileRenameTimer: ReturnType<typeof setTimeout> | null = null;
+    let fileRenameTimeout: NodeJS.Timeout | null = null;
     app.serviceManager.contents.fileChanged.connect((sender, change) => {
       if (change.type === 'rename') {
-        if (fileRenameTimer) {
-          clearTimeout(fileRenameTimer);
+        // wait for the file to be renamed before creating embeddings file
+        if (fileRenameTimeout) {
+          clearTimeout(fileRenameTimeout);
         }
-        fileRenameTimer = setTimeout(() => {
+        fileRenameTimeout = setTimeout(() => {
           getEmbeddings(notebookTracker, app, aiClient, aiChatModelProvider);
         }, 2000);
       }
@@ -459,17 +468,27 @@ const extension: JupyterFrontEndPlugin<void> = {
     });
 
     let debounceTimeout: NodeJS.Timeout | null = null;
+    const contentChangedHandlers = new WeakMap<any, () => void>();
 
     notebookTracker.activeCellChanged.connect((sender, cell) => {
       if (cell) {
-        cell.model.contentChanged.connect(() => {
+        // Remove previous handler if exists to avoid memory leaks
+        const prevHandler = contentChangedHandlers.get(cell.model);
+        if (prevHandler) {
+          cell.model.contentChanged.disconnect(prevHandler);
+        }
+
+        const handler = () => {
           if (debounceTimeout) {
             clearTimeout(debounceTimeout);
           }
           debounceTimeout = setTimeout(() => {
             getEmbeddings(notebookTracker, app, aiClient, aiChatModelProvider);
           }, 1000);
-        });
+        };
+
+        contentChangedHandlers.set(cell.model, handler);
+        cell.model.contentChanged.connect(handler);
       }
     });
 

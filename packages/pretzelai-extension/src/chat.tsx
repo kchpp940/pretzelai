@@ -25,7 +25,7 @@ import { OpenAI } from 'openai';
 import posthog from 'posthog-js';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import pretzelSvg from '../style/icons/pretzel.svg';
-import { CHAT_SYSTEM_MESSAGE, chatAIStream, ChatMessage } from './chatAIUtils';
+import { CHAT_SYSTEM_MESSAGE, chatAIStream } from './chatAIUtils';
 import { RendermimeMarkdown } from './components/rendermime-markdown';
 import { globalState } from './globalState';
 import { getDefaultSettings } from './migrations/defaultSettings';
@@ -118,7 +118,6 @@ export function Chat({
   const [hoveredImage, setHoveredImage] = useState<string | null>(null);
   const [canBeUsedForImages, setCanBeUsedForImages] = useState(false);
   const canBeUsedForImagesRef = useRef(false);
-  const fetchChatHistoryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     const currentSettingsVersion = pretzelSettingsJSON?.version;
@@ -131,10 +130,12 @@ export function Chat({
     canBeUsedForImagesRef.current = canBeUsedForImages;
   }, [canBeUsedForImages]);
 
+  const fetchChatHistoryTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
   const fetchChatHistory = async () => {
     const notebook = notebookTracker?.currentWidget;
     if (!notebook?.model) {
-      fetchChatHistoryTimer.current = setTimeout(fetchChatHistory, 1000);
+      fetchChatHistoryTimeoutRef.current = setTimeout(fetchChatHistory, 1000);
       return;
     }
     if (notebook?.model && !isAiGenerating) {
@@ -219,14 +220,17 @@ export function Chat({
     // Load chat history
     fetchChatHistory();
     const labShell = app.shell as ILabShell;
-    labShell.currentPathChanged.connect((sender, args) => {
+    const handlePathChanged = () => {
       fetchChatHistory();
-    });
+    };
+    labShell.currentPathChanged.connect(handlePathChanged);
 
     return () => {
-      if (fetchChatHistoryTimer.current) {
-        clearTimeout(fetchChatHistoryTimer.current);
+      // Cleanup timeout on unmount
+      if (fetchChatHistoryTimeoutRef.current) {
+        clearTimeout(fetchChatHistoryTimeoutRef.current);
       }
+      labShell.currentPathChanged.disconnect(handlePathChanged);
     };
   }, []);
 
@@ -324,18 +328,15 @@ export function Chat({
     setMessages(prevMessages => {
       const updatedMessages = [...prevMessages, newMessage as IMessage];
 
-      const formattedMessages: ChatMessage[] = [
+      const formattedMessages = [
         {
-          role: 'system',
+          role: 'system' as const,
           content: CHAT_SYSTEM_MESSAGE
         },
-        ...updatedMessages.map(
-          msg =>
-            ({
-              role: msg.role,
-              content: msg.content
-            }) as ChatMessage
-        )
+        ...updatedMessages.map(msg => ({
+          role: msg.role,
+          content: msg.content
+        }))
       ];
 
       (async () => {
@@ -412,18 +413,15 @@ export function Chat({
     setMessages(prevMessages => {
       const updatedMessages = [...prevMessages, newMessage as IMessage];
 
-      const formattedMessages: ChatMessage[] = [
+      const formattedMessages = [
         {
-          role: 'system',
+          role: 'system' as const,
           content: CHAT_SYSTEM_MESSAGE
         },
-        ...updatedMessages.map(
-          msg =>
-            ({
-              role: msg.role,
-              content: msg.content
-            }) as ChatMessage
-        )
+        ...updatedMessages.map(msg => ({
+          role: msg.role,
+          content: msg.content
+        }))
       ];
 
       (async () => {
