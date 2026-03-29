@@ -37,6 +37,7 @@ import {
   PRETZEL_FOLDER,
   readEmbeddings
 } from './utils';
+import { AIMessage, MessageContent, TextContent } from './types';
 import { providersInfo } from './migrations/providerInfo';
 import { ImagePreview } from './components/ImagePreview';
 
@@ -47,13 +48,7 @@ const pretzelIcon = new LabIcon({
   svgstr: pretzelSvg
 });
 
-interface IMessage {
-  id: string;
-  content: string;
-  role: 'user' | 'assistant' | 'system';
-}
-
-const initialMessage: IMessage[] = [{ id: '1', content: 'Hello, how can I assist you today?', role: 'assistant' }];
+const initialMessage: AIMessage[] = [{ id: '1', content: 'Hello, how can I assist you today?', role: 'assistant' }];
 const isMac = /Mac/i.test(navigator.userAgent);
 const keyCombination = isMac ? 'Ctrl+Cmd+B' : 'Ctrl+Alt+B';
 const historyPrevKeyCombination = isMac ? '⇧⌘<' : '⇧^<';
@@ -102,11 +97,11 @@ export function Chat({
   themeManager,
   pretzelSettingsJSON
 }: IChatProps): JSX.Element {
-  const [messages, setMessages] = useState(initialMessage);
-  const [chatHistory, setChatHistory] = useState<IMessage[][]>([]);
+  const [messages, setMessages] = useState<AIMessage[]>(initialMessage);
+  const [chatHistory, setChatHistory] = useState<AIMessage[][]>([]);
   const [, setChatIndex] = useState(0);
   const clearChatRef = useRef<() => void>(() => {});
-  const chatHistoryRef = useRef<IMessage[][]>([]);
+  const chatHistoryRef = useRef<AIMessage[][]>([]);
   const [isAiGenerating, setIsAiGenerating] = useState(false);
   const [referenceSource, setReferenceSource] = useState('');
   const [stopGeneration, setStopGeneration] = useState<() => void>(() => () => {});
@@ -130,12 +125,12 @@ export function Chat({
     canBeUsedForImagesRef.current = canBeUsedForImages;
   }, [canBeUsedForImages]);
 
-  const fetchChatHistoryTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-
-  const fetchChatHistory = async () => {
+  const fetchTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  
+  const fetchChatHistory = useCallback(async () => {
     const notebook = notebookTracker?.currentWidget;
     if (!notebook?.model) {
-      fetchChatHistoryTimeoutRef.current = setTimeout(fetchChatHistory, 1000);
+      fetchTimeoutRef.current = setTimeout(fetchChatHistory, 1000);
       return;
     }
     if (notebook?.model && !isAiGenerating) {
@@ -152,12 +147,16 @@ export function Chat({
       if (response.ok) {
         // chat_history.json exists
         const file = await app.serviceManager.contents.get(chatHistoryPath);
-        const chatHistoryJson = JSON.parse(file.content);
-        setChatHistory(chatHistoryJson);
-        setChatIndex(chatHistoryJson.length);
+        try {
+          const chatHistoryJson = JSON.parse(file.content) as AIMessage[][];
+          setChatHistory(chatHistoryJson);
+          setChatIndex(chatHistoryJson.length);
+        } catch (error) {
+          console.error('Error parsing chat history JSON:', error);
+        }
       }
     }
-  };
+  }, [notebookTracker, app, isAiGenerating]);
 
   const saveMessages = async () => {
     if (!notebookTracker) return;
@@ -179,7 +178,7 @@ export function Chat({
         try {
           const chatHistoryJson = JSON.parse(file.content);
           if (chatHistoryJson.length > 0) {
-            let lastChat: IMessage[] = chatHistoryJson[chatHistoryJson.length - 1];
+            let lastChat: AIMessage[] = chatHistoryJson[chatHistoryJson.length - 1];
             if (
               lastChat.every(m => messages.some(m2 => m2.content === m.content && m2.role === m.role && m2.id === m.id))
             ) {
@@ -220,19 +219,17 @@ export function Chat({
     // Load chat history
     fetchChatHistory();
     const labShell = app.shell as ILabShell;
-    const handlePathChanged = () => {
+    labShell.currentPathChanged.connect((sender, args) => {
       fetchChatHistory();
-    };
-    labShell.currentPathChanged.connect(handlePathChanged);
+    });
 
+    // Cleanup function
     return () => {
-      // Cleanup timeout on unmount
-      if (fetchChatHistoryTimeoutRef.current) {
-        clearTimeout(fetchChatHistoryTimeoutRef.current);
+      if (fetchTimeoutRef.current) {
+        clearTimeout(fetchTimeoutRef.current);
       }
-      labShell.currentPathChanged.disconnect(handlePathChanged);
     };
-  }, []);
+  }, [fetchChatHistory, app]);
 
   useEffect(() => {
     chatHistoryRef.current = chatHistory;
@@ -326,14 +323,16 @@ export function Chat({
     };
 
     setMessages(prevMessages => {
-      const updatedMessages = [...prevMessages, newMessage as IMessage];
+      const updatedMessages = [...prevMessages, newMessage as AIMessage];
 
       const formattedMessages = [
         {
+          id: 'system',
           role: 'system' as const,
           content: CHAT_SYSTEM_MESSAGE
         },
         ...updatedMessages.map(msg => ({
+          id: msg.id,
           role: msg.role,
           content: msg.content
         }))
@@ -411,14 +410,16 @@ export function Chat({
     };
 
     setMessages(prevMessages => {
-      const updatedMessages = [...prevMessages, newMessage as IMessage];
+      const updatedMessages = [...prevMessages, newMessage as AIMessage];
 
       const formattedMessages = [
         {
+          id: 'system',
           role: 'system' as const,
           content: CHAT_SYSTEM_MESSAGE
         },
         ...updatedMessages.map(msg => ({
+          id: msg.id,
           role: msg.role,
           content: msg.content
         }))
@@ -476,9 +477,9 @@ export function Chat({
         const aiMessage = {
           id: String(updatedMessages.length + 1),
           content: chunk,
-          role: 'assistant'
+          role: 'assistant' as const
         };
-        updatedMessages.push(aiMessage as IMessage);
+        updatedMessages.push(aiMessage as AIMessage);
       } else if (lastMessage.role === 'assistant') {
         lastMessage.content += chunk;
       }
@@ -701,16 +702,16 @@ export function Chat({
               rmRegistry={rmRegistry}
               markdownStr={
                 message.role === 'user'
-                  ? '***You:*** ' + (Array.isArray(message.content) ? message.content[0].text : message.content)
-                  : '***AI:*** ' + (Array.isArray(message.content) ? message.content[0].text : message.content)
+                  ? '***You:*** ' + (Array.isArray(message.content) ? (message.content[0] as TextContent).text : message.content)
+                  : '***AI:*** ' + (Array.isArray(message.content) ? (message.content[0] as TextContent).text : message.content)
               }
               notebookTracker={notebookTracker}
               role={message.role}
               images={
                 Array.isArray(message.content)
-                  ? (message.content as Array<any>)
-                      .filter((item: any) => item.type === 'image')
-                      .map((item: any) => item.data as string)
+                  ? message.content
+                      .filter((item: MessageContent) => item.type === 'image')
+                      .map((item: MessageContent) => ('data' in item ? item.data : ''))
                   : []
               }
             />

@@ -98,14 +98,6 @@ const extension: JupyterFrontEndPlugin<void> = {
     const provider = new PretzelInlineProvider(notebookTracker, settingRegistry, app);
     providerManager.registerInlineProvider(provider);
 
-    // Clean up provider when the app is disposed
-    app.started.then(() => {
-      const cleanup = () => {
-        provider.dispose();
-      };
-      window.addEventListener('beforeunload', cleanup);
-    });
-
     provider.isFetchingChanged.connect((_, isFetching) => {
       const activeCell = notebookTracker.activeCell;
       if (activeCell) {
@@ -338,11 +330,10 @@ const extension: JupyterFrontEndPlugin<void> = {
       }
     }
 
-    let initializePromptHistoryTimeout: NodeJS.Timeout | null = null;
-
+    let initializeTimeout: NodeJS.Timeout | null = null;
     const initializePromptHistory = async () => {
       if (!notebookTracker.currentWidget?.model) {
-        initializePromptHistoryTimeout = setTimeout(initializePromptHistory, 1000);
+        initializeTimeout = setTimeout(initializePromptHistory, 1000);
         return;
       }
       const savedHistory = await loadPromptHistory(app, notebookTracker);
@@ -433,14 +424,10 @@ const extension: JupyterFrontEndPlugin<void> = {
     });
 
     // getEmbeddings when a file is renamed
-    let fileRenameTimeout: NodeJS.Timeout | null = null;
     app.serviceManager.contents.fileChanged.connect((sender, change) => {
       if (change.type === 'rename') {
         // wait for the file to be renamed before creating embeddings file
-        if (fileRenameTimeout) {
-          clearTimeout(fileRenameTimeout);
-        }
-        fileRenameTimeout = setTimeout(() => {
+        setTimeout(() => {
           getEmbeddings(notebookTracker, app, aiClient, aiChatModelProvider);
         }, 2000);
       }
@@ -468,17 +455,20 @@ const extension: JupyterFrontEndPlugin<void> = {
     });
 
     let debounceTimeout: NodeJS.Timeout | null = null;
-    const contentChangedHandlers = new WeakMap<any, () => void>();
+    let contentChangedHandler: (() => void) | null = null;
 
     notebookTracker.activeCellChanged.connect((sender, cell) => {
-      if (cell) {
-        // Remove previous handler if exists to avoid memory leaks
-        const prevHandler = contentChangedHandlers.get(cell.model);
-        if (prevHandler) {
-          cell.model.contentChanged.disconnect(prevHandler);
-        }
+      // Clear previous timeout and handler
+      if (debounceTimeout) {
+        clearTimeout(debounceTimeout);
+        debounceTimeout = null;
+      }
+      if (contentChangedHandler) {
+        contentChangedHandler = null;
+      }
 
-        const handler = () => {
+      if (cell) {
+        contentChangedHandler = () => {
           if (debounceTimeout) {
             clearTimeout(debounceTimeout);
           }
@@ -486,9 +476,7 @@ const extension: JupyterFrontEndPlugin<void> = {
             getEmbeddings(notebookTracker, app, aiClient, aiChatModelProvider);
           }, 1000);
         };
-
-        contentChangedHandlers.set(cell.model, handler);
-        cell.model.contentChanged.connect(handler);
+        cell.model.contentChanged.connect(contentChangedHandler);
       }
     });
 
@@ -786,10 +774,16 @@ const extension: JupyterFrontEndPlugin<void> = {
 
     function initSidePanel() {
       const labShell = app.shell as ILabShell;
-      const sidePanel = Array.from(labShell.widgets('right')).find(widget => widget.id === 'pretzelai-chat-panel');
+      const widgets = Array.from(labShell.widgets('right')) as Array<{
+        id?: string;
+        isVisible?: boolean;
+        dispose?: () => void;
+        node?: HTMLElement;
+      }>;
+      const sidePanel = widgets.find(widget => widget.id === 'pretzelai-chat-panel');
       const wasExpanded = sidePanel?.isVisible || false;
 
-      if (sidePanel) {
+      if (sidePanel && sidePanel.dispose) {
         sidePanel.dispose();
       }
       const newSidePanel = createAndAddSidePanel(wasExpanded);
@@ -802,10 +796,16 @@ const extension: JupyterFrontEndPlugin<void> = {
 
     function toggleChatPanel() {
       const labShell = app.shell as ILabShell;
-      const sidePanel = Array.from(labShell.widgets('right')).find(widget => widget.id === 'pretzelai-chat-panel');
+      const widgets = Array.from(labShell.widgets('right')) as Array<{
+        id?: string;
+        isVisible?: boolean;
+        dispose?: () => void;
+        node?: HTMLElement;
+      }>;
+      const sidePanel = widgets.find(widget => widget.id === 'pretzelai-chat-panel');
       const wasExpanded = sidePanel?.isVisible || false;
 
-      if (sidePanel) {
+      if (sidePanel && sidePanel.node && sidePanel.id) {
         const inputArea = sidePanel.node.querySelector('textarea');
         if (document.activeElement === inputArea) {
           // If the input is focused, just collapse the right area without removing the panel
@@ -821,10 +821,14 @@ const extension: JupyterFrontEndPlugin<void> = {
         createAndAddSidePanel(wasExpanded);
         // Ensure the side panel is focused after creation
         requestAnimationFrame(() => {
-          const newlyCreatedPanel = Array.from(labShell.widgets('right')).find(
-            widget => widget.id === 'pretzelai-chat-panel'
-          );
-          if (newlyCreatedPanel) {
+          const newWidgets = Array.from(labShell.widgets('right')) as Array<{
+            id?: string;
+            isVisible?: boolean;
+            dispose?: () => void;
+            node?: HTMLElement;
+          }>;
+          const newlyCreatedPanel = newWidgets.find(widget => widget.id === 'pretzelai-chat-panel');
+          if (newlyCreatedPanel && newlyCreatedPanel.node) {
             const inputArea = newlyCreatedPanel.node.querySelector('textarea');
             inputArea?.focus();
           }
