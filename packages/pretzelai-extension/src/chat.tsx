@@ -25,7 +25,7 @@ import { OpenAI } from 'openai';
 import posthog from 'posthog-js';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import pretzelSvg from '../style/icons/pretzel.svg';
-import { CHAT_SYSTEM_MESSAGE, chatAIStream, ChatMessage } from './chatAIUtils';
+import { CHAT_SYSTEM_MESSAGE, chatAIStream } from './chatAIUtils';
 import { RendermimeMarkdown } from './components/rendermime-markdown';
 import { globalState } from './globalState';
 import { getDefaultSettings } from './migrations/defaultSettings';
@@ -118,8 +118,6 @@ export function Chat({
   const [hoveredImage, setHoveredImage] = useState<string | null>(null);
   const [canBeUsedForImages, setCanBeUsedForImages] = useState(false);
   const canBeUsedForImagesRef = useRef(false);
-  const pendingTimeoutsRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
-  const abortControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     const currentSettingsVersion = pretzelSettingsJSON?.version;
@@ -132,11 +130,20 @@ export function Chat({
     canBeUsedForImagesRef.current = canBeUsedForImages;
   }, [canBeUsedForImages]);
 
+  const fetchChatHistoryTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (fetchChatHistoryTimeoutRef.current) {
+        clearTimeout(fetchChatHistoryTimeoutRef.current);
+      }
+    };
+  }, []);
+
   const fetchChatHistory = async () => {
     const notebook = notebookTracker?.currentWidget;
     if (!notebook?.model) {
-      const fetchTimeout = setTimeout(fetchChatHistory, 1000);
-      pendingTimeoutsRef.current.add(fetchTimeout);
+      fetchChatHistoryTimeoutRef.current = setTimeout(fetchChatHistory, 1000);
       return;
     }
     if (notebook?.model && !isAiGenerating) {
@@ -224,17 +231,6 @@ export function Chat({
     labShell.currentPathChanged.connect((sender, args) => {
       fetchChatHistory();
     });
-
-    return () => {
-      // Cleanup all pending timeouts
-      pendingTimeoutsRef.current.forEach(timeout => clearTimeout(timeout));
-      pendingTimeoutsRef.current.clear();
-      // Abort any pending requests
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-        abortControllerRef.current = null;
-      }
-    };
   }, []);
 
   useEffect(() => {
@@ -331,13 +327,13 @@ export function Chat({
     setMessages(prevMessages => {
       const updatedMessages = [...prevMessages, newMessage as IMessage];
 
-      const formattedMessages: ChatMessage[] = [
+      const formattedMessages = [
         {
           role: 'system',
           content: CHAT_SYSTEM_MESSAGE
         },
         ...updatedMessages.map(msg => ({
-          role: msg.role as 'user' | 'assistant' | 'system',
+          role: msg.role,
           content: msg.content
         }))
       ];
@@ -354,8 +350,7 @@ export function Chat({
         );
 
         const controller = new AbortController();
-        abortControllerRef.current = controller;
-        const signal = controller.signal;
+        let signal = controller.signal;
         setStopGeneration(() => () => controller.abort());
 
         await chatAIStream({
@@ -380,7 +375,6 @@ export function Chat({
           signal,
           notebookTracker
         });
-        abortControllerRef.current = null;
       })();
 
       return updatedMessages;
@@ -418,21 +412,20 @@ export function Chat({
     setMessages(prevMessages => {
       const updatedMessages = [...prevMessages, newMessage as IMessage];
 
-      const formattedMessages: ChatMessage[] = [
+      const formattedMessages = [
         {
           role: 'system',
           content: CHAT_SYSTEM_MESSAGE
         },
         ...updatedMessages.map(msg => ({
-          role: msg.role as 'user' | 'assistant' | 'system',
+          role: msg.role,
           content: msg.content
         }))
       ];
 
       (async () => {
         const controller = new AbortController();
-        abortControllerRef.current = controller;
-        const signal = controller.signal;
+        let signal = controller.signal;
         setStopGeneration(() => () => controller.abort());
 
         await chatAIStream({
@@ -457,7 +450,6 @@ export function Chat({
           signal,
           notebookTracker
         });
-        abortControllerRef.current = null;
       })();
 
       return updatedMessages;

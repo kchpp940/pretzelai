@@ -16,7 +16,7 @@ import {
 } from '@jupyterlab/completer';
 import { INotebookTracker } from '@jupyterlab/notebook';
 import { ISettingRegistry } from '@jupyterlab/settingregistry';
-import { PLUGIN_ID, streamAnthropicCompletion } from './utils';
+import { PLUGIN_ID, streamAnthropicCompletion, AnthropicMessage } from './utils';
 import OpenAI from 'openai';
 import { JupyterFrontEnd } from '@jupyterlab/application';
 import posthog from 'posthog-js';
@@ -47,9 +47,22 @@ export class PretzelInlineProvider implements IInlineCompletionProvider {
   }
   readonly identifier = '@pretzelai/inline-completer';
   readonly name = 'Pretzel AI inline completion';
-  private debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private debounceTimer: NodeJS.Timeout | null = null;
   private abortController: AbortController | null = null;
-  private currentFetchId: number = 0;
+
+  /**
+   * Dispose method to clean up resources when the provider is destroyed
+   */
+  dispose(): void {
+    if (this.debounceTimer) {
+      clearTimeout(this.debounceTimer);
+    }
+    this.debounceTimer = null;
+    if (this.abortController) {
+      this.abortController.abort();
+    }
+    this.abortController = null;
+  }
 
   private _prefixFromRequest(request: CompletionHandler.IRequest): string {
     const currentCellIndex = this.notebookTracker?.currentWidget?.model!.sharedModel.cells.findIndex(
@@ -137,11 +150,9 @@ export class PretzelInlineProvider implements IInlineCompletionProvider {
 
     // Create new AbortController for this fetch
     this.abortController = new AbortController();
-    const fetchId = ++this.currentFetchId;
 
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
-      this.debounceTimer = null;
     }
     const settings = await this.settingRegistry.load(PLUGIN_ID);
     const pretzelSettingsJSON = settings.get('pretzelSettingsJSON').composite as any;
@@ -151,7 +162,7 @@ export class PretzelInlineProvider implements IInlineCompletionProvider {
       return { items: [] };
     }
     const copilotProvider = inlineCopilotSettings.modelProvider || 'Pretzel AI';
-    const copilotModel = inlineCopilotSettings.modelString || 'pretzelai';
+    const copilotModel = inlineCopilotSettings.modelString || 'pretzelai'; // FIXME: use this in code
     const providers = pretzelSettingsJSON.providers || {};
     const mistralSettings = providers['Mistral']?.apiSettings || {};
     const mistralApiKey = mistralSettings?.apiKey?.value || '';
@@ -168,11 +179,6 @@ export class PretzelInlineProvider implements IInlineCompletionProvider {
 
     return new Promise(resolve => {
       this.debounceTimer = setTimeout(async () => {
-        // Check if this fetch is still the current one
-        if (fetchId !== this.currentFetchId) {
-          return;
-        }
-
         this.isFetchingChanged.emit(true);
 
         let prompt = this._prefixFromRequest(request);
@@ -196,6 +202,7 @@ export class PretzelInlineProvider implements IInlineCompletionProvider {
         }
 
         // Hardcoded completion without AI for first line of notebook
+        // TODO: We can add more hardcoded imports for common libraries
         if (prompt.indexOf('\n') === -1 && !suffix && 'import pandas as pd'.startsWith(prompt)) {
           resolve({
             items: [
@@ -204,14 +211,12 @@ export class PretzelInlineProvider implements IInlineCompletionProvider {
               }
             ]
           });
+          // Spinner will not show because it emits false before the UI can react
           this.isFetchingChanged.emit(false);
           return;
         }
 
         prompt = `# python code for jupyter notebook\n\n${prompt}`;
-
-        // Store reference to current abort controller
-        const currentAbortController = this.abortController;
 
         try {
           let completion;
@@ -228,13 +233,8 @@ export class PretzelInlineProvider implements IInlineCompletionProvider {
                 max_tokens: 500,
                 stop: stops
               }),
-              signal: currentAbortController?.signal
+              signal: this.abortController?.signal // Add abort signal to fetch
             });
-            // Check if aborted after fetch
-            if (currentAbortController?.signal.aborted) {
-              resolve({ items: [] });
-              return;
-            }
             completion = (await fetchResponse.json()).completion;
           } else if (copilotProvider === 'OpenAI' && openAiApiKey) {
             const openai = new OpenAI({ apiKey: openAiApiKey, dangerouslyAllowBrowser: true });
@@ -255,11 +255,12 @@ export class PretzelInlineProvider implements IInlineCompletionProvider {
                 ]
               },
               {
-                signal: currentAbortController?.signal
+                signal: this.abortController?.signal
               }
             );
             completion = openaiResponse.choices[0].message.content;
           } else if (copilotProvider === 'Mistral' && mistralApiKey) {
+            // FIXME: Allow for newer model types
             if (copilotModel === 'codestral-latest') {
               const data = await fetch('https://api.mistral.ai/v1/fim/completions', {
                 method: 'POST',
@@ -276,12 +277,9 @@ export class PretzelInlineProvider implements IInlineCompletionProvider {
                   max_tokens: 500,
                   temperature: 0
                 }),
-                signal: currentAbortController?.signal
+                signal: this.abortController?.signal
               });
-              if (currentAbortController?.signal.aborted) {
-                resolve({ items: [] });
-                return;
-              }
+              // Note: Response parsing might not work as expected due to 'no-cors' mode, which can lead to an opaque response.
               completion = (await data.json()).choices[0].message.content;
             } else {
               const mistral = new MistralClient(mistralApiKey);
@@ -302,25 +300,34 @@ export class PretzelInlineProvider implements IInlineCompletionProvider {
                 maxTokens: 500,
                 safePrompt: false
               });
-              completion = mistralResponse.choices[0].message.content;
+              // Check if aborted after request completes
+              if (this.abortController?.signal.aborted) {
+                completion = '';
+              } else {
+                completion = mistralResponse.choices[0].message.content;
+              }
             }
           } else if (copilotProvider === 'Azure' && azureApiKey && azureBaseUrl && azureDeploymentName) {
             const client = new OpenAIClient(azureBaseUrl, new AzureKeyCredential(azureApiKey));
             const result = await client.getCompletions(azureDeploymentName, [getInlinePrompt(prompt, suffix)]);
-            completion = result.choices[0].text;
+            // Check if aborted after request completes
+            if (this.abortController?.signal.aborted) {
+              completion = '';
+            } else {
+              completion = result.choices[0].text;
+            }
           } else if (copilotProvider === 'Anthropic' && anthropicApiKey) {
-            const messages = [
+            const messages: AnthropicMessage[] = [
               {
                 role: 'user',
                 content: getInlinePrompt(prompt, suffix)
               }
             ];
-            const stream = await streamAnthropicCompletion(anthropicApiKey, messages, copilotModel, 500);
+            const stream = await streamAnthropicCompletion(anthropicApiKey, messages, copilotModel, 500, this.abortController?.signal);
             let completionContent = '';
             for await (const chunk of stream) {
-              if (currentAbortController?.signal.aborted) {
-                resolve({ items: [] });
-                return;
+              if (this.abortController?.signal.aborted) {
+                break;
               }
               completionContent += chunk.choices[0].delta.content;
             }
@@ -342,12 +349,8 @@ export class PretzelInlineProvider implements IInlineCompletionProvider {
                 messages: messages,
                 stream: true
               }),
-              signal: currentAbortController?.signal
+              signal: this.abortController?.signal
             });
-            if (currentAbortController?.signal.aborted) {
-              resolve({ items: [] });
-              return;
-            }
             const reader = response.body!.getReader();
             const decoder = new TextDecoder('utf-8');
             let isReading = true;
@@ -387,7 +390,7 @@ export class PretzelInlineProvider implements IInlineCompletionProvider {
                 ]
               },
               {
-                signal: currentAbortController?.signal
+                signal: this.abortController?.signal
               }
             );
             completion = groqResponse.choices[0].message.content;
@@ -405,20 +408,18 @@ export class PretzelInlineProvider implements IInlineCompletionProvider {
               }
             ]
           });
-        } catch (error: unknown) {
-          if (error instanceof Error && error.name === 'AbortError') {
+        } catch (error: any) {
+          if (error.name === 'AbortError') {
             console.log('Fetch aborted');
           } else {
-            console.error('Error:', error instanceof Error ? error.message : String(error));
+            console.error('Error:', JSON.stringify(error));
           }
           resolve({
             items: []
           });
         } finally {
           this.isFetchingChanged.emit(false);
-          if (this.abortController === currentAbortController) {
-            this.abortController = null;
-          }
+          this.abortController = null; // Reset the abort controller
         }
       }, DEBOUNCE_TIME);
     });
